@@ -146,7 +146,7 @@ jobs:
       - name: Build Database image
         run: |
           docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:$IMAGE_TAG \
-            -f docker/mysql/Dockerfile .
+            docker/mysql/
           docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:$IMAGE_TAG \
                      $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:latest
 
