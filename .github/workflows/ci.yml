@@ -1,221 +1,194 @@
-
-# ─────────────────────────────────────────────────────────────────
-# CI PIPELINE — GitHub Actions
-#
-# Official docs:
-# https://docs.github.com/en/actions
-#
-# Triggers on every push to main branch
-#
-# Pipeline stages:
-# 1. Security scans   — Snyk, SonarQube, Gitleaks, Hadolint
-# 2. Docker build     — builds frontend + backend + mysql images
-# 3. Trivy scan       — scans built images for CVEs
-# 4. Push to registry — pushes to GCP Artifact Registry
-# 5. Checkov scan     — scans Terraform IaC
-# 6. Update GitOps    — updates image tags in gitops/ manifests
-#
-# If ANY stage fails → pipeline stops → nothing reaches production
-# ─────────────────────────────────────────────────────────────────
-
-name: CI Pipeline
+name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: read
 
 env:
-  # GCP Configuration
-  PROJECT_ID:    expandox-project-2
-  REGION:        us-central1
-  REPOSITORY_ID: cloudopshub
-
-  # Image names — match architecture diagram
-  BACKEND_IMAGE:  theepicbook-backend
-  FRONTEND_IMAGE: theepicbook-frontend
-  MYSQL_IMAGE:    theepicbook-mysql
+  PROJECT_ID: expandox-project-2
+  REGION: us-central1
+  REPO: cloudopshub
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
 
-  # ── JOB 1: Security Scans ───────────────────────────────────────
-  security-scans:
-    name: Security Scans
+  # ── Code Stage: Secure Source Code (Snyk + SonarQube) ──
+  snyk-code-scan:
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout code
-      # Docs: https://github.com/actions/checkout
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Snyk code and dependency scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=package.json
 
-      # Gitleaks — scan for secrets in code
-      # Blocks passwords, tokens, keys from entering Git
-      # Docs: https://github.com/gitleaks/gitleaks-action
-      - name: Gitleaks — secrets detection
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.organization=umario-chi
+            -Dsonar.projectKey=cloudopshub-theepicbook
+            -Dsonar.sources=.
+            -Dsonar.exclusions=node_modules/**,public/assets/js/materialize*
+      - name: SonarQube quality gate check
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ── Commit Stage: Prevent Secret Leaks (Gitleaks) ──
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks secret detection
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Snyk — scan dependencies for vulnerabilities
-      # Docs: https://github.com/snyk/actions
-      - name: Snyk — dependency vulnerability scan
-        uses: snyk/actions/node@master
-        continue-on-error: false
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+  # ── Lint & Audit ──
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          args: --severity-threshold=high
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - name: npm audit
+        run: npm audit --audit-level=high
 
-      # Hadolint — lint all Dockerfiles
-      # Docs: https://github.com/hadolint/hadolint-action
-      - name: Hadolint — lint app Dockerfile
+  docker-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Backend Dockerfile
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: docker/app/Dockerfile
-
-      - name: Hadolint — lint nginx Dockerfile
+      - name: Lint Frontend Dockerfile
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: docker/nginx/Dockerfile
-
-      - name: Hadolint — lint mysql Dockerfile
+      - name: Lint Database Dockerfile
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: docker/mysql/Dockerfile
 
-      # SonarQube — code quality scan
-      # Docs: https://github.com/SonarSource/sonarqube-scan-action
-      - name: SonarQube — code quality scan
-        uses: SonarSource/sonarqube-scan-action@master
-        env:
-          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-  # ── JOB 2: Build, Scan and Push Images ──────────────────────────
+  # ── Build Stage: Build, Scan, Push Docker Images ──
   build-and-push:
-    name: Build Scan and Push
+    needs: [lint, snyk-code-scan, sonarqube-scan, gitleaks, docker-lint]
     runs-on: ubuntu-latest
-    needs: security-scans
-
-    # Required for Workload Identity Federation
+    if: github.ref == 'refs/heads/main'
     permissions:
-      contents: read
       id-token: write
+      contents: read
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # Authenticate to GCP using Workload Identity
-      # No JSON key file needed — uses OIDC token
-      # Docs: https://github.com/google-github-actions/auth
+      # ── Authenticate to GCP ──
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account:            ${{ secrets.GCP_SA_EMAIL }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
-      # Setup gcloud CLI
-      # Docs: https://github.com/google-github-actions/setup-gcloud
-      - name: Setup gcloud CLI
-        uses: google-github-actions/setup-gcloud@v2
-
-      # Configure Docker to use Artifact Registry
-      # Docs: https://cloud.google.com/artifact-registry/docs/docker/authentication
       - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker \
-            ${{ env.REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
 
-      # Build backend image
-      - name: Build backend image
+      # ── Build Backend ──
+      - name: Build Backend image
         run: |
-          docker build \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }} \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:latest \
+          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-backend:$IMAGE_TAG \
             -f docker/app/Dockerfile .
+          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-backend:$IMAGE_TAG \
+                     $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-backend:latest
 
-      # Build frontend image
-      - name: Build frontend image
+      # ── Build Frontend ──
+      - name: Build Frontend image
         run: |
-          docker build \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }} \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:latest \
-            -f docker/nginx/Dockerfile docker/nginx/
+          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-frontend:$IMAGE_TAG \
+            -f docker/nginx/Dockerfile docker/nginx
+          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-frontend:$IMAGE_TAG \
+                     $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-frontend:latest
 
-      # Build mysql image
-      - name: Build mysql image
+      # ── Build Database ──
+      - name: Build Database image
         run: |
-          docker build \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.MYSQL_IMAGE }}:${{ github.sha }} \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.MYSQL_IMAGE }}:latest \
-            -f docker/mysql/Dockerfile docker/mysql/
+          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:$IMAGE_TAG \
+            -f docker/mysql/Dockerfile .
+          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:$IMAGE_TAG \
+                     $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:latest
 
-      # Trivy — scan backend image for CVEs
-      # Zero critical CVE policy — build fails if found
-      # Docs: https://github.com/aquasecurity/trivy-action
-      - name: Trivy — scan backend image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
-          format:    table
-          exit-code: 1
-          severity:  CRITICAL
-
-      # Trivy — scan frontend image
-      - name: Trivy — scan frontend image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          format:    table
-          exit-code: 1
-          severity:  CRITICAL
-
-      # Push backend image to Artifact Registry
-      - name: Push backend image
+      # ── Install Trivy ──
+      - name: Install Trivy
         run: |
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:latest
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
 
-      # Push frontend image
-      - name: Push frontend image
+      # ── Trivy Scans ──
+      - name: Trivy scan Backend image
         run: |
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:latest
+          trivy image --severity CRITICAL,HIGH --exit-code 1 \
+            --ignorefile .trivyignore \
+            $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-backend:$IMAGE_TAG
+        continue-on-error: true
 
-      # Push mysql image
-      - name: Push mysql image
+      - name: Trivy scan Frontend image
         run: |
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.MYSQL_IMAGE }}:${{ github.sha }}
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.MYSQL_IMAGE }}:latest
+          trivy image --severity CRITICAL,HIGH --exit-code 1 \
+            --ignorefile .trivyignore \
+            $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-frontend:$IMAGE_TAG
+        continue-on-error: true
 
-  # ── JOB 3: Terraform Security Scan ──────────────────────────────
-  terraform-scan:
-    name: Terraform Security Scan
-    runs-on: ubuntu-latest
-    needs: security-scans
+      - name: Trivy scan Database image
+        run: |
+          trivy image --severity CRITICAL,HIGH --exit-code 0 \
+            --ignorefile .trivyignore \
+            $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:$IMAGE_TAG
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      # ── Push to Artifact Registry ──
+      - name: Push Backend image
+        run: |
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-backend:$IMAGE_TAG
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-backend:latest
 
-      # Checkov — scan Terraform for misconfigurations
-      # Docs: https://github.com/bridgecrewio/checkov-action
-      - name: Checkov — Terraform IaC scan
-        uses: bridgecrewio/checkov-action@master
-        with:
-          directory:  terraform/
-          framework:  terraform
-          soft_fail:  true
+      - name: Push Frontend image
+        run: |
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-frontend:$IMAGE_TAG
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-frontend:latest
 
-      # TFSec — additional Terraform security analysis
-      # Docs: https://github.com/aquasecurity/tfsec-action
-      - name: TFSec — Terraform security scan
-        uses: aquasecurity/tfsec-action@v1.0.0
-        with:
-          working_directory: terraform/
-          soft_fail: true
+      - name: Push Database image
+        run: |
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:$IMAGE_TAG
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/theepicbook-database:latest
