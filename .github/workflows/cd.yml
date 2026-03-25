@@ -9,10 +9,9 @@
 # Triggers after CI pipeline completes successfully
 #
 # Pipeline stages:
-# 1. Checkov + TFSec  — scan Terraform configs
-# 2. Update GitOps    — update image tags in gitops/ manifests
-# 3. Commit + Push    — push updated manifests to repo
-# 4. ArgoCD Sync      — trigger ArgoCD to deploy new images
+# 1. Update GitOps    — update image tags in gitops/ manifests
+# 2. Commit + Push    — push updated manifests to repo
+# 3. ArgoCD Sync      — trigger ArgoCD to deploy new images
 #
 # ArgoCD watches gitops/ directory
 # When manifest changes → ArgoCD pulls new image → deploys to VM
@@ -21,9 +20,8 @@
 name: CD Pipeline
 
 on:
-  # Runs after CI pipeline completes successfully
   workflow_run:
-    workflows: ["CI Pipeline"]
+    workflows: ["CI"]
     types:
       - completed
     branches:
@@ -39,24 +37,15 @@ env:
   # Image names
   BACKEND_IMAGE:  theepicbook-backend
   FRONTEND_IMAGE: theepicbook-frontend
-  MYSQL_IMAGE:    theepicbook-mysql
+  DATABASE_IMAGE: theepicbook-database
 
 jobs:
 
-  # ── JOB 1: Only run if CI passed ────────────────────────────────
-  check-ci:
-    name: Check CI Status
-    runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
-    steps:
-      - name: CI passed — proceeding with CD
-        run: echo "CI pipeline passed — starting CD pipeline"
-
-  # ── JOB 2: Update GitOps Manifests ──────────────────────────────
+  # ── JOB 1: Update GitOps Manifests ──────────────────────────────
   update-gitops:
     name: Update GitOps Manifests
     runs-on: ubuntu-latest
-    needs: check-ci
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     permissions:
       contents: write
@@ -66,35 +55,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # Need full git history to push changes
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # Get the commit SHA from the CI pipeline run
       - name: Get commit SHA
         id: sha
         run: |
           echo "sha=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
-          echo "short_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
       # Update image tags in dev GitOps manifest
-      # CI already pushed images with this SHA
-      # Docs: https://argo-cd.readthedocs.io/en/stable/core_concepts
       - name: Update dev image tags
         run: |
-          # Update backend image tag
-          sed -i "s|${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:.*|${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.BACKEND_IMAGE }}:${{ steps.sha.outputs.sha }}|g" \
+          SHA=${{ steps.sha.outputs.sha }}
+
+          sed -i "s|$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY_ID/$BACKEND_IMAGE:.*|$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY_ID/$BACKEND_IMAGE:$SHA|g" \
             gitops/dev/docker-compose.yml
 
-          # Update frontend image tag
-          sed -i "s|${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:.*|${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.FRONTEND_IMAGE }}:${{ steps.sha.outputs.sha }}|g" \
+          sed -i "s|$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY_ID/$FRONTEND_IMAGE:.*|$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY_ID/$FRONTEND_IMAGE:$SHA|g" \
             gitops/dev/docker-compose.yml
 
-          # Update mysql image tag
-          sed -i "s|${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.MYSQL_IMAGE }}:.*|${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_ID }}/${{ env.MYSQL_IMAGE }}:${{ steps.sha.outputs.sha }}|g" \
+          sed -i "s|$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY_ID/$DATABASE_IMAGE:.*|$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY_ID/$DATABASE_IMAGE:$SHA|g" \
             gitops/dev/docker-compose.yml
 
-      # Commit and push updated manifest
       - name: Commit and push updated manifests
         run: |
           git config user.email "github-actions@cloudopshub.com"
@@ -104,9 +86,9 @@ jobs:
             git commit -m "cd: update dev image tags to ${{ steps.sha.outputs.sha }}"
           git push
 
-  # ── JOB 3: Trigger ArgoCD Sync ──────────────────────────────────
+  # ── JOB 2: Deploy via ArgoCD ────────────────────────────────────
   argocd-sync:
-    name: Trigger ArgoCD Sync
+    name: Deploy via ArgoCD
     runs-on: ubuntu-latest
     needs: update-gitops
 
@@ -118,21 +100,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Authenticate to GCP
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account:            ${{ secrets.GCP_SA_EMAIL }}
 
-      # Setup gcloud CLI
       - name: Setup gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
 
-      # SSH into VM via IAP and trigger ArgoCD sync
-      # VM has no public IP — access only via Cloud IAP
-      # Docs: https://cloud.google.com/iap/docs/using-tcp-forwarding
-      - name: Trigger ArgoCD sync via IAP SSH
+      - name: Deploy and verify via IAP SSH
         run: |
           gcloud compute ssh ${{ env.VM_NAME }} \
             --zone=${{ env.VM_ZONE }} \
@@ -143,18 +120,6 @@ jobs:
               git pull origin main && \
               docker-compose -f gitops/dev/docker-compose.yml pull && \
               docker-compose -f gitops/dev/docker-compose.yml up -d && \
-              echo 'Deployment complete'
-            "
-
-      # Verify deployment succeeded
-      - name: Verify deployment
-        run: |
-          gcloud compute ssh ${{ env.VM_NAME }} \
-            --zone=${{ env.VM_ZONE }} \
-            --project=${{ env.PROJECT_ID }} \
-            --tunnel-through-iap \
-            --command="
-              docker-compose \
-                -f /opt/cloudopshub/gitops/dev/docker-compose.yml \
-                ps
+              echo '── Deployment complete ──' && \
+              docker-compose -f gitops/dev/docker-compose.yml ps
             "
