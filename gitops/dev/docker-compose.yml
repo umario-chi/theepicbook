@@ -40,7 +40,7 @@ services:
   app:
     # Image tag updated by CI pipeline on every push
     # CI replaces :latest with the actual commit SHA
-    image: us-central1-docker.pkg.dev/expandox-project-2/cloudopshub/theepicbook-backend:latest
+    image: us-central1-docker.pkg.dev/expandox-project-2/cloudopshub/theepicbook-backend:547a58aca328521a3daae987040af6eaf153166a
     container_name: theepicbook-app
     restart: unless-stopped
     environment:
@@ -66,7 +66,7 @@ services:
 
   # ── Nginx Reverse Proxy ─────────────────────────────────────────
   nginx:
-    image: us-central1-docker.pkg.dev/expandox-project-2/cloudopshub/theepicbook-frontend:latest
+    image: us-central1-docker.pkg.dev/expandox-project-2/cloudopshub/theepicbook-frontend:547a58aca328521a3daae987040af6eaf153166a
     container_name: theepicbook-nginx
     restart: unless-stopped
     ports:
