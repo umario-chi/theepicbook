@@ -4,17 +4,13 @@
 #
 # Official docs:
 # https://docs.github.com/en/actions
-# https://argo-cd.readthedocs.io/en/stable
 #
 # Triggers after CI pipeline completes successfully
 #
 # Pipeline stages:
 # 1. Update GitOps    — update image tags in gitops/ manifests
 # 2. Commit + Push    — push updated manifests to repo
-# 3. ArgoCD Sync      — trigger ArgoCD to deploy new images
-#
-# ArgoCD watches gitops/ directory
-# When manifest changes → ArgoCD pulls new image → deploys to VM
+# 3. Deploy to VM     — SSH via IAP, pull new images, restart services
 # ─────────────────────────────────────────────────────────────────
 
 name: CD Pipeline
@@ -86,9 +82,9 @@ jobs:
             git commit -m "cd: update dev image tags to ${{ steps.sha.outputs.sha }}"
           git push
 
-  # ── JOB 2: Deploy via ArgoCD ────────────────────────────────────
-  argocd-sync:
-    name: Deploy via ArgoCD
+  # ── JOB 2: Deploy to VM via IAP SSH ─────────────────────────────
+  deploy-vm:
+    name: Deploy to VM
     runs-on: ubuntu-latest
     needs: update-gitops
 
